@@ -231,12 +231,14 @@ class CQL:
 
         # 3. Evaluate Q on all sampled actions
         def _q_values(critic_fn, obs, actions):
-            """Evaluate Q for (B, N, act_dim) actions. Returns (B, N, 1)."""
-            obs_exp = obs.unsqueeze(1).expand(-1, actions.shape[1], -1)  # (B,N,obs)
-            obs_flat = obs_exp.reshape(-1, obs.shape[-1])
+            """Evaluate Q for (B, N, act_dim) actions. Returns (B, N, 1).
+            critic_fn is a nn.Sequential that expects cat([obs, act]) as input."""
+            N = actions.shape[1]
+            obs_exp  = obs.unsqueeze(1).expand(-1, N, -1).reshape(-1, obs.shape[-1])
             act_flat = actions.reshape(-1, actions.shape[-1])
-            q = critic_fn(obs_flat, act_flat)  # (B*N, 1)
-            return q.view(B, actions.shape[1], 1)
+            sa = torch.cat([obs_exp, act_flat], dim=-1)  # (B*N, obs+act)
+            q = critic_fn(sa)                            # (B*N, 1)
+            return q.view(B, N, 1)
 
         q1_pi   = _q_values(self.critic.q1, S, pi_actions)    # (B, N, 1)
         q2_pi   = _q_values(self.critic.q2, S, pi_actions)
