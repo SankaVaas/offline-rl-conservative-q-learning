@@ -18,21 +18,46 @@ class Logger:
         self.agent_name = agent_name
         self.start_time = time.time()
 
-        self._train_file = open(os.path.join(log_dir, "train_metrics.csv"), "w", newline="")
-        self._eval_file  = open(os.path.join(log_dir, "eval_metrics.csv"),  "w", newline="")
+        self._train_path = os.path.join(log_dir, "train_metrics.csv")
+        self._eval_path  = os.path.join(log_dir, "eval_metrics.csv")
 
+        self._train_file   = None
         self._train_writer = None
-        self._eval_writer  = None
+        self._all_train_keys = []   # grows as new metric keys appear
+
+        self._eval_file   = None
+        self._eval_writer = None
 
         self._eval_history = []
+        self._pending_rows = []     # buffer rows until we know all keys
 
     def log_step(self, step: int, metrics: Dict[str, float]) -> None:
-        if self._train_writer is None:
-            fields = ["step"] + sorted(metrics.keys())
-            self._train_writer = csv.DictWriter(self._train_file, fieldnames=fields)
-            self._train_writer.writeheader()
         row = {"step": step, **metrics}
-        self._train_writer.writerow(row)
+        new_keys = [k for k in row if k not in self._all_train_keys]
+
+        if new_keys:
+            # New keys discovered — must rewrite the CSV with expanded header
+            self._all_train_keys.extend(new_keys)
+            self._pending_rows.append(row)
+
+            # Close old file if open, rewrite with full header
+            if self._train_file:
+                self._train_file.close()
+
+            self._train_file = open(self._train_path, "w", newline="")
+            self._train_writer = csv.DictWriter(
+                self._train_file,
+                fieldnames=self._all_train_keys,
+                extrasaction="ignore",
+            )
+            self._train_writer.writeheader()
+            # Replay all buffered rows
+            for r in self._pending_rows:
+                self._train_writer.writerow(r)
+            self._train_file.flush()
+        else:
+            self._pending_rows.append(row)
+            self._train_writer.writerow(row)
 
     def log_eval(self, step: int, raw_score: float, normalized: float, info: Dict) -> None:
         elapsed = time.time() - self.start_time
@@ -44,9 +69,15 @@ class Logger:
             **{k: v for k, v in info.items() if isinstance(v, (int, float))},
         }
         if self._eval_writer is None:
-            self._eval_writer = csv.DictWriter(self._eval_file, fieldnames=list(row.keys()))
+            self._eval_file   = open(self._eval_path, "w", newline="")
+            self._eval_writer = csv.DictWriter(
+                self._eval_file,
+                fieldnames=list(row.keys()),
+                extrasaction="ignore",
+            )
             self._eval_writer.writeheader()
         self._eval_writer.writerow(row)
+        self._eval_file.flush()
         self._eval_history.append(row)
 
         console.print(
@@ -56,6 +87,11 @@ class Logger:
         )
 
     def summary(self) -> None:
+        if self._train_file:
+            self._train_file.close()
+        if self._eval_file:
+            self._eval_file.close()
+
         if not self._eval_history:
             return
         best = max(self._eval_history, key=lambda x: x["normalized_score"])
@@ -65,5 +101,3 @@ class Logger:
         table.add_row("At step",               f"{best['step']:,}")
         table.add_row("Total time",            f"{(time.time()-self.start_time)/60:.1f} min")
         console.print(table)
-        self._train_file.close()
-        self._eval_file.close()
