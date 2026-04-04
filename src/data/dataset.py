@@ -34,42 +34,55 @@ def load_dataset(name: str) -> Tuple[Dict[str, np.ndarray], Dict[str, Any]]:
     """
     Load offline dataset by name or path.
 
-    Priority:
-      1. .npz file path (custom)
-      2. Minari dataset
-      3. Synthetic fallback (for testing without downloads)
+    Supported name formats:
+      - "mujoco/hopper/medium-v2"     ← Minari (real data, recommended)
+      - "hopper-synthetic"            ← synthetic LQR fallback (CPU testing)
+      - "/path/to/dataset.npz"        ← custom local file
 
     Returns:
-        dataset:  D4RL-style dict
+        dataset:  D4RL-style dict with keys observations/actions/rewards/next_observations/terminals
         env_info: {'obs_dim', 'act_dim', 'max_action'}
     """
     if name.endswith(".npz"):
         return _load_npz(name)
 
-    # Try Minari
+    if "synthetic" in name:
+        return _synthetic_dataset(name)
+
+    # Real dataset via Minari
     try:
         return _load_minari(name)
     except Exception as e:
-        print(f"[Dataset] Minari load failed ({e}). Using synthetic data.")
+        print(f"[Dataset] Minari load failed ({e}). Falling back to synthetic data.")
         return _synthetic_dataset(name)
 
 
 def _load_minari(name: str) -> Tuple[Dict, Dict]:
     import minari
-    dataset = minari.load_dataset(name)
-    obs_dim = dataset.observation_space.shape[0]
-    act_dim = dataset.action_space.shape[0]
+
+    # Minari 0.4+ uses namespaced IDs like "mujoco/hopper/medium-v2"
+    # Try loading directly first, then with download=True
+    try:
+        dataset = minari.load_dataset(name, download=False)
+    except FileNotFoundError:
+        print(f"[Dataset] '{name}' not cached locally. Downloading...")
+        minari.download_dataset(name)
+        dataset = minari.load_dataset(name, download=False)
+
+    obs_dim    = dataset.observation_space.shape[0]
+    act_dim    = dataset.action_space.shape[0]
     max_action = float(dataset.action_space.high.max())
 
     obs, acts, rews, next_obs, terms = [], [], [], [], []
     for ep in dataset.iterate_episodes():
         T = len(ep.rewards)
-        obs.append(ep.observations[:-1])
-        acts.append(ep.actions)
-        rews.append(ep.rewards)
-        next_obs.append(ep.observations[1:])
-        terms.append(np.zeros(T, dtype=np.float32))
-        terms[-1][-1] = 1.0  # mark episode end as terminal
+        obs.append(ep.observations[:-1].astype(np.float32))
+        acts.append(ep.actions.astype(np.float32))
+        rews.append(ep.rewards.astype(np.float32))
+        next_obs.append(ep.observations[1:].astype(np.float32))
+        t = np.zeros(T, dtype=np.float32)
+        t[-1] = 1.0   # mark final step of each episode as terminal
+        terms.append(t)
 
     data = {
         "observations":      np.concatenate(obs),
@@ -79,7 +92,7 @@ def _load_minari(name: str) -> Tuple[Dict, Dict]:
         "terminals":         np.concatenate(terms),
     }
     env_info = {"obs_dim": obs_dim, "act_dim": act_dim, "max_action": max_action}
-    print(f"[Dataset] Loaded Minari '{name}': {len(data['rewards']):,} transitions.")
+    print(f"[Dataset] Loaded '{name}': {len(data['rewards']):,} transitions.")
     return data, env_info
 
 
@@ -112,8 +125,8 @@ def _synthetic_dataset(name: str, n: int = 200_000) -> Tuple[Dict, Dict]:
 
     The 'medium' quality behavior policy mixes: 50% random, 50% noisy-optimal.
     """
-    # Determine env spec from name
-    key = next((k for k in ENV_SPECS if k in name), "hopper")
+    # Determine env spec from name — matches any segment e.g. "mujoco/hopper/medium-v2"
+    key = next((k for k in ENV_SPECS if k in name.lower()), "hopper")
     obs_dim, act_dim, max_action = ENV_SPECS[key]
 
     print(f"[Dataset] Generating synthetic LQR dataset: n={n:,}, "
