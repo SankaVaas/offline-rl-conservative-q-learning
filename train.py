@@ -48,6 +48,8 @@ def parse_args():
     p.add_argument("--seed",     type=int, default=42)
     p.add_argument("--discount", type=float, default=0.99)
     p.add_argument("--tau",      type=float, default=0.005)
+    p.add_argument("--device",   type=str, default=None,
+                   help="cuda or cpu (default: auto-detect)")
     p.add_argument("--save_dir", type=str, default="experiments/runs")
     # CQL-specific
     p.add_argument("--cql_alpha",    type=float, default=1.0)
@@ -70,7 +72,7 @@ def build_agent(args, state_dim: int, action_dim: int):
         action_dim=action_dim,
         discount=args.discount,
         tau=args.tau,
-        device="cuda" if torch.cuda.is_available() else "cpu",
+        device=args.device,
     )
     if args.agent == "td3bc":
         return TD3BC(**common, alpha=args.bc_alpha)
@@ -87,6 +89,12 @@ def build_agent(args, state_dim: int, action_dim: int):
 # ---------------------------------------------------------------------------
 
 def train(args):
+    # ---- Device auto-detect ----
+    if args.device is None:
+        args.device = "cuda" if torch.cuda.is_available() else "cpu"
+    console.print(f"[bold cyan]Device:[/bold cyan] {args.device}"
+                  + (f" ({torch.cuda.get_device_name(0)})" if args.device == "cuda" else ""))
+
     # ---- Reproducibility ----
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -105,6 +113,7 @@ def train(args):
         action_dim=action_dim,
         normalize_obs=True,
         normalize_reward=True,
+        device=args.device,       # ← tensors will be on CUDA when device="cuda"
     )
     buffer.load_from_dict(dataset)
 

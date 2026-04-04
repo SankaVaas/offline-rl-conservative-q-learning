@@ -245,7 +245,11 @@ class OfflineReplayBuffer:
         )
 
     def _to_tensor(self, arr: np.ndarray) -> torch.Tensor:
-        return torch.FloatTensor(arr).to(self.device)
+        return torch.from_numpy(arr).float().to(self.device)
+
+    def set_device(self, device: str) -> None:
+        """Call this after building the agent so buffer tensors match network device."""
+        self.device = torch.device(device)
 
     # ------------------------------------------------------------------
     # Properties & utilities
