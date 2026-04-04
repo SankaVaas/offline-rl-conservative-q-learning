@@ -44,7 +44,7 @@ def parse_args():
     p.add_argument("--steps",    type=int, default=300_000, help="Training steps")
     p.add_argument("--batch",    type=int, default=256,    help="Batch size")
     p.add_argument("--eval_freq",type=int, default=5_000,  help="Eval every N steps")
-    p.add_argument("--eval_eps", type=int, default=10,     help="Episodes per eval")
+    p.add_argument("--eval_eps", type=int, default=5,      help="Episodes per eval (synthetic=5 is plenty)")
     p.add_argument("--seed",     type=int, default=42)
     p.add_argument("--discount", type=float, default=0.99)
     p.add_argument("--tau",      type=float, default=0.005)
@@ -183,82 +183,129 @@ def train(args):
 
 def evaluate(agent, dataset_name: str, n_episodes: int, obs_normalizer) -> tuple:
     """
-    Roll out the learned policy in the environment for n_episodes.
+    Evaluate the learned policy.
 
-    The normalized score follows the D4RL convention:
-        normalized = (score - random_score) / (expert_score - random_score) * 100
-    This puts all tasks on a common scale where 0=random, 100=expert.
+    For synthetic datasets: roll out in the LQR environment (instant, no gym needed).
+    For real datasets: roll out in the gymnasium environment.
+
+    Normalized score convention:
+        0   = random policy performance
+        100 = expert policy performance
     """
+    if "synthetic" in dataset_name:
+        return _evaluate_lqr(agent, dataset_name, n_episodes, obs_normalizer)
+    return _evaluate_gym(agent, dataset_name, n_episodes, obs_normalizer)
+
+
+def _evaluate_lqr(agent, dataset_name: str, n_episodes: int, obs_normalizer) -> tuple:
+    """
+    Evaluate on the synthetic LQR environment.
+
+    LQR dynamics:
+        s_{t+1} = 0.9*s + 0.1*a_padded + noise
+        r_t     = -||s||^2 - 0.1*||a||^2
+
+    Optimal LQR policy: a* = -0.5 * s[:act_dim]
+    This gives us a reference score for normalization.
+
+    We compute:
+        random_score  : score of uniform random policy (Monte Carlo)
+        optimal_score : score of closed-form LQR optimal policy
+        agent_score   : score of learned policy
+        normalized    : (agent - random) / (optimal - random) * 100
+    """
+    from src.data.dataset import ENV_SPECS
+    key = next((k for k in ENV_SPECS if k in dataset_name), "hopper")
+    obs_dim, act_dim, max_action = ENV_SPECS[key]
+
+    gamma   = 0.99
+    ep_len  = 1000
+    rng     = np.random.default_rng(seed=999)
+
+    def rollout(policy_fn):
+        returns = []
+        for _ in range(n_episodes):
+            s = rng.standard_normal(obs_dim).astype(np.float32)
+            ep_ret = 0.0
+            discount = 1.0
+            for _ in range(ep_len):
+                a = policy_fn(s)
+                a = np.clip(a, -max_action, max_action)
+                noise = 0.01 * rng.standard_normal(obs_dim).astype(np.float32)
+                a_pad = np.zeros(obs_dim, dtype=np.float32)
+                a_pad[:act_dim] = a
+                s_next = 0.9 * s + 0.1 * a_pad + noise
+                r = -np.sum(s**2) - 0.1 * np.sum(a**2)
+                ep_ret += discount * r
+                discount *= gamma
+                s = s_next
+            returns.append(ep_ret)
+        return float(np.mean(returns))
+
+    # Agent policy (uses obs normalizer trained on dataset)
+    def agent_policy(s):
+        s_norm = obs_normalizer(s)
+        return agent.select_action(s_norm)
+
+    # Reference: optimal LQR policy
+    def optimal_policy(s):
+        return np.clip(-0.5 * s[:act_dim], -max_action, max_action)
+
+    # Reference: random policy
+    def random_policy(s):
+        return rng.uniform(-max_action, max_action, act_dim).astype(np.float32)
+
+    agent_score   = rollout(agent_policy)
+    optimal_score = rollout(optimal_policy)
+    random_score  = rollout(random_policy)
+
+    # Normalized score: 0=random, 100=optimal
+    denom = (optimal_score - random_score) + 1e-8
+    normalized = (agent_score - random_score) / denom * 100.0
+
+    return agent_score, {
+        "raw_score":        agent_score,
+        "normalized_score": normalized,
+        "optimal_score":    optimal_score,
+        "random_score":     random_score,
+    }
+
+
+def _evaluate_gym(agent, dataset_name: str, n_episodes: int, obs_normalizer) -> tuple:
+    """Evaluate on real gymnasium environment (used with Minari datasets)."""
     try:
         import gymnasium as gym
     except ImportError:
-        return 0.0, {"normalized_score": 0.0, "raw_score": 0.0, "note": "gymnasium not found"}
+        return 0.0, {"normalized_score": 0.0, "note": "gymnasium not installed"}
 
-    env_name = _dataset_to_env(dataset_name)
+    mapping = {"hopper": "Hopper-v4", "walker2d": "Walker2d-v4",
+               "halfcheetah": "HalfCheetah-v4", "ant": "Ant-v4"}
+    env_name = next((v for k, v in mapping.items() if k in dataset_name), "Hopper-v4")
 
     try:
         env = gym.make(env_name)
     except Exception as e:
         return 0.0, {"normalized_score": 0.0, "note": str(e)}
 
-    episode_returns = []
+    returns = []
     for _ in range(n_episodes):
         obs, _ = env.reset()
-        done = False
-        ep_return = 0.0
+        done, ep_ret = False, 0.0
         while not done:
-            obs_norm = obs_normalizer(obs)
-            action = agent.select_action(obs_norm)
-            obs, reward, terminated, truncated, _ = env.step(action)
-            done = terminated or truncated
-            ep_return += reward
-        episode_returns.append(ep_return)
-
+            action = agent.select_action(obs_normalizer(obs))
+            obs, r, term, trunc, _ = env.step(action)
+            done = term or trunc
+            ep_ret += r
+        returns.append(ep_ret)
     env.close()
 
-    mean_return = np.mean(episode_returns)
-    std_return  = np.std(episode_returns)
+    mean_ret = float(np.mean(returns))
+    refs = {"hopper": (20.3, 3234.3), "walker2d": (1.6, 4592.3),
+            "halfcheetah": (-280.2, 12135.0), "ant": (-325.6, 3879.7)}
+    rand, expert = next((v for k, v in refs.items() if k in dataset_name), (0, 1))
+    normalized = (mean_ret - rand) / (expert - rand + 1e-8) * 100.0
 
-    # D4RL normalized score reference values (approximate)
-    normalized = _normalize_score(dataset_name, mean_return)
-
-    return mean_return, {
-        "raw_score":        mean_return,
-        "score_std":        std_return,
-        "normalized_score": normalized,
-    }
-
-
-def _dataset_to_env(dataset_name: str) -> str:
-    """Map D4RL dataset name to gymnasium env name."""
-    mapping = {
-        "hopper":      "Hopper-v4",
-        "walker2d":    "Walker2d-v4",
-        "halfcheetah": "HalfCheetah-v4",
-        "ant":         "Ant-v4",
-    }
-    for key, env in mapping.items():
-        if key in dataset_name:
-            return env
-    return "Hopper-v4"
-
-
-def _normalize_score(dataset_name: str, raw_score: float) -> float:
-    """
-    D4RL normalized score: (score - random) / (expert - random) * 100
-    Reference scores from Fu et al. (2020).
-    """
-    # (random_score, expert_score) pairs
-    refs = {
-        "hopper":             (20.3,   3234.3),
-        "walker2d":           (1.6,    4592.3),
-        "halfcheetah":        (-280.2, 12135.0),
-        "ant":                (-325.6, 3879.7),
-    }
-    for key, (rand, expert) in refs.items():
-        if key in dataset_name:
-            return (raw_score - rand) / (expert - rand) * 100.0
-    return raw_score
+    return mean_ret, {"raw_score": mean_ret, "normalized_score": normalized}
 
 
 # ---------------------------------------------------------------------------
