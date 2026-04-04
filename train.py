@@ -70,7 +70,7 @@ def build_agent(args, state_dim: int, action_dim: int):
         action_dim=action_dim,
         discount=args.discount,
         tau=args.tau,
-        device="cpu",
+        device="cuda" if torch.cuda.is_available() else "cpu",
     )
     if args.agent == "td3bc":
         return TD3BC(**common, alpha=args.bc_alpha)
