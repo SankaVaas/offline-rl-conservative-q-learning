@@ -8,8 +8,8 @@ Steps: 50,000 | Batch: 1024 | Device: cuda
 
 | Agent | Our Score | Paper Score |
 |---|---|---|
-| TD3+BC | 29.2 | 59.3 |
-| CQL | 95.9 | 79.4 |
+| TD3+BC | 29.4 | 59.3 |
+| CQL | 95.3 | 79.4 |
 | IQL | -0.4 | 75.1 |
 
 ## Plots
