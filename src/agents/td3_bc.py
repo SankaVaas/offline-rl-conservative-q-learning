@@ -204,7 +204,9 @@ class TD3BC:
           - alpha controls the tradeoff: higher alpha = more conservative.
         """
         pi = self.actor(batch.observations)
-        q_pi = self.critic.q1(batch.observations, pi)  # use only Q1 for actor (TD3 convention)
+        # critic.q1 is a nn.Sequential expecting cat([obs, act]) as single input
+        sa = torch.cat([batch.observations, pi], dim=-1)
+        q_pi = self.critic.q1(sa)
 
         # Lambda normalization (detach to avoid gradient through normalization)
         lmbda = self.alpha / (q_pi.abs().mean().detach() + 1e-8)
