@@ -302,3 +302,40 @@ class SquashedGaussianActor(nn.Module):
         with torch.no_grad():
             action, _ = self.forward(state, deterministic=deterministic)
         return action
+
+    def log_prob_of(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        """
+        Compute log pi(action | state) for a SPECIFIC action from the dataset.
+
+        This is what IQL's AWR actor update needs: rather than sampling a
+        fresh action and using its log_prob (which evaluates the policy at
+        a random point), we invert the tanh squashing to recover the
+        pre-squash action u, then evaluate the Gaussian log_prob at u
+        with the tanh Jacobian correction.
+
+        Inverse tanh (arctanh):
+            u = arctanh(a / max_action)
+            Valid only when |a / max_action| < 1 — we clamp for numerical safety.
+
+        Args:
+            state:  (B, state_dim)
+            action: (B, action_dim) — dataset actions, already squashed to [-max_a, max_a]
+
+        Returns:
+            log_prob: (B, 1)
+        """
+        h  = self.trunk(state)
+        mu = self.mu_head(h)
+        log_std = self.log_std_head(h).clamp(LOG_STD_MIN, LOG_STD_MAX)
+        std = log_std.exp()
+
+        dist = Normal(mu, std)
+
+        # Invert tanh squashing to get pre-squash action u
+        # Clamp to avoid arctanh(±1) = ±inf
+        a_norm = (action / self.max_action).clamp(-1 + 1e-6, 1 - 1e-6)
+        u = torch.atanh(a_norm)
+
+        # Gaussian log prob at pre-squash action
+        log_prob = dist.log_prob(u) - torch.log(1.0 - a_norm.pow(2) + 1e-6)
+        return log_prob.sum(dim=-1, keepdim=True)  # (B, 1)

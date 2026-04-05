@@ -225,34 +225,27 @@ class IQL:
         """
         AWR policy extraction: pi = argmax_pi E[exp(beta*A(s,a)) * log pi(a|s)]
 
-        Advantage: A(s,a) = Q(s,a) - V(s)   (computed on dataset pairs)
-        Weight:    w(s,a) = exp(beta * A(s,a))  (clipped to exp_adv_max)
+        CRITICAL: log_prob must be evaluated at the DATASET action a_data,
+        not at a freshly sampled action. The AWR objective is:
+            L = -E_{(s,a)~D}[ w(s,a) * log pi(a | s) ]
+        where w(s,a) = exp(beta * (Q(s,a) - V(s))).
 
-        This is equivalent to solving:
-            KL(pi_target || pi) where pi_target ∝ mu(a|s) * exp(beta * Q(s,a))
-        i.e., find the closest policy to behavior mu that upweights
-        high-Q actions by the exponentiated advantage.
-
-        The actor only trains via log_prob on DATASET actions — it never
-        generates actions that go into Q evaluation. This is the OOD-free
-        guarantee of IQL.
+        We use the SquashedGaussianActor's log_prob_of() to evaluate
+        log pi(a_data | s) at the exact dataset action, with the tanh
+        Jacobian correction applied. This keeps the actor entirely within
+        the dataset support — no OOD actions are ever generated.
         """
         with torch.no_grad():
             q1, q2 = self.critic(batch.observations, batch.actions)
-            q_min = torch.min(q1, q2)
-            v = self.value(batch.observations)
+            q_min   = torch.min(q1, q2)
+            v       = self.value(batch.observations)
+            advantage = q_min - v                                      # (B, 1)
+            exp_adv   = torch.exp(self.temperature * advantage).clamp(max=self.exp_adv_max)
 
-            advantage = q_min - v  # (B, 1)
-            # Exponentiated advantage with temperature and max clipping
-            exp_adv = torch.exp(self.temperature * advantage).clamp(max=self.exp_adv_max)
+        # Evaluate log pi(a_data | s) — must use dataset actions, not samples
+        log_prob = self.actor.log_prob_of(batch.observations, batch.actions)  # (B, 1)
 
-        # log_prob of dataset actions under current policy
-        _, log_prob = self.actor(batch.observations)
-        # Alternatively: use actor's log_prob at specific dataset actions
-        # Here we use the reparameterized sample's log_prob as an approximation
-
-        # AWR loss: weighted negative log-likelihood
-        # exp_adv.detach() so advantage doesn't receive gradients through actor
+        # AWR loss: weighted negative log-likelihood on dataset actions
         actor_loss = -(exp_adv.detach() * log_prob).mean()
 
         self.actor_optim.zero_grad()
@@ -261,10 +254,10 @@ class IQL:
         self.actor_optim.step()
 
         return {
-            "actor_loss":    actor_loss.item(),
+            "actor_loss":     actor_loss.item(),
             "advantage_mean": advantage.mean().item(),
-            "exp_adv_mean":  exp_adv.mean().item(),
-            "log_prob_mean": log_prob.mean().item(),
+            "exp_adv_mean":   exp_adv.mean().item(),
+            "log_prob_mean":  log_prob.mean().item(),
         }
 
     # ------------------------------------------------------------------
